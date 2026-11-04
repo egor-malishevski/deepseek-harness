@@ -1300,6 +1300,78 @@ describe('configurable-provider directory', () => {
     expect(catalogModels('typesafe').size).toBe(0)
   })
 
+  describe('model discovery merge', () => {
+    const route = { api: 'openai-completions', baseURL: 'https://gw.test', discoverModels: true }
+    const resolveRoute = (
+      profile: Record<string, unknown>,
+      listing?: { id: string; name?: string; contextWindow?: number; maxTokens?: number }[],
+      validation: 'strict' | 'deferred' = 'deferred',
+    ) => resolveProfiles(
+      { gw: { ...route, ...profile } },
+      validation,
+      listing === undefined ? undefined : new Map([['gw', listing]]),
+    ).get('gw')!
+    const ids = (profile: ReturnType<typeof resolveRoute>): string[] => profile.piProvider!.getModels().map(model => model.id)
+
+    it('serves exactly what it did before when discovery is off', () => {
+      const profile = resolveProfiles({ gw: { api: 'openai-completions', baseURL: 'https://gw.test', models: [{ id: 'seed' }] } }, 'strict', new Map([['gw', [{ id: 'listed' }]]])).get('gw')!
+      expect(ids(profile)).toEqual(['seed'])
+      expect(profile.offered).toBeUndefined()
+      expect(profile.discovery).toBeUndefined()
+      expect(profile.listingProblems).toEqual([])
+    })
+
+    it('serves the seed and offers everything while no listing has loaded, even with models: []', () => {
+      const profile = resolveRoute({ models: [{ id: 'seed' }] })
+      expect(ids(profile)).toEqual(['seed'])
+      expect(profile.offered).toBeUndefined()
+      expect(profile.discovery).toEqual({ api: 'openai-completions', baseURL: 'https://gw.test', timeoutMs: 5000, maxAgeMs: 600_000 })
+      expect(ids(resolveRoute({ models: [] }))).toEqual([])
+      expect(resolveRoute({ models: [] }, undefined, 'strict').catalogError).toBeUndefined()
+    })
+
+    it('resolves listed models in listing order with route defaults and no reasoning', () => {
+      const profile = resolveRoute({ defaultContextWindow: 1234, defaultMaxTokens: 99, defaultInput: ['text', 'image'] }, [{ id: 'b' }, { id: 'a' }, { id: 'b' }])
+      expect(ids(profile)).toEqual(['b', 'a'])
+      expect([...profile.offered!]).toEqual(['b', 'a'])
+      expect(profile.piProvider!.getModels()[0]).toMatchObject({ contextWindow: 1234, maxTokens: 99, input: ['text', 'image'], reasoning: false, name: 'b' })
+      expect(profile.configuredMaxTokens.size).toBe(0)
+    })
+
+    it('lets the seed win and the listing fill only what the seed leaves unset', () => {
+      const profile = resolveRoute(
+        { models: [{ id: 'm', name: 'Seed name', contextWindow: 10 }] },
+        [{ id: 'm', name: 'Listed name', contextWindow: 999, maxTokens: 77 }],
+      )
+      expect(profile.piProvider!.getModels()[0]).toMatchObject({ name: 'Seed name', contextWindow: 10, maxTokens: 77 })
+      // A listed capacity sizes the model; it is not a request default.
+      expect(profile.configuredMaxTokens.size).toBe(0)
+      const seeded = resolveRoute({ models: [{ id: 'm', maxTokens: 5 }] }, [{ id: 'm', maxTokens: 77 }])
+      expect(seeded.configuredMaxTokens.get('m')).toBe(5)
+    })
+
+    it('keeps an unlisted seed model resolvable but not offered', () => {
+      const profile = resolveRoute({ models: [{ id: 'seed-only' }, { id: 'both' }] }, [{ id: 'both' }, { id: 'new' }])
+      expect(ids(profile)).toEqual(['both', 'new', 'seed-only'])
+      expect([...profile.offered!]).toEqual(['both', 'new'])
+    })
+
+    it('skips a listed model that cannot resolve without marking the route broken', () => {
+      const profile = resolveRoute({}, [{ id: 'ok' }, { id: 'bad', contextWindow: 1.5 }], 'strict')
+      expect(ids(profile)).toEqual(['ok'])
+      expect([...profile.offered!]).toEqual(['ok'])
+      expect(profile.modelErrors.size).toBe(0)
+      expect(profile.catalogError).toBeUndefined()
+      expect(profile.listingProblems).toEqual([expect.stringContaining('"bad" contextWindow must be a positive integer')])
+    })
+
+    it('still diagnoses a broken seed entry on a discovering route', () => {
+      const deferred = resolveRoute({ models: [{ id: 'seed', contextWindow: 1.5 }] }, [{ id: 'listed' }])
+      expect(deferred.modelErrors.has('seed')).toBe(true)
+      expect(() => resolveRoute({ models: [{ id: 'seed', contextWindow: 1.5 }] }, [{ id: 'listed' }], 'strict')).toThrow(/contextWindow/)
+    })
+  })
+
   it('lists a route a stored profile names as a catalog route, not a declared one', async () => {
     // `declared` answers catalog membership, so a profile stored against a
     // route pi-ai ships is not mislabelled as one this deployment invented,

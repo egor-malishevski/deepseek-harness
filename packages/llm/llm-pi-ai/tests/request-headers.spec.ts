@@ -8,6 +8,13 @@ import * as PiAi from '../src/index.ts'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
 
+declare module '@deepseek-ai/dsh-llm/types' {
+  interface LlmRequestPurposeMap {
+    /** Test-only purpose that proves header contributors receive the request purpose. */
+    'headers-probe': true
+  }
+}
+
 afterEach(async () => {
   await closeMockServers()
   vi.unstubAllEnvs()
@@ -78,6 +85,18 @@ it('composes request-local headers, enforces attribution, and removes disposed l
   await assemble(ctx, { model: 'deepseek-flash', messages: [], sessionId: SessionId('two') })
   expect(server.headers[2]).toMatchObject({ 'x-request-session': 'static-session', 'x-company': 'static' })
   expect(server.headers[2]).not.toHaveProperty('x-second-listener')
+})
+
+it('passes a declared request purpose to header contributors', async () => {
+  const server = await mockServer([{ events: textEvents }])
+  const ctx = await harness(server.url)
+  const seen: PiAi.PiAiRequestHeaderContext[] = []
+  ctx.on('llm-pi-ai/request-headers', (request, _headers, next) => {
+    seen.push(request)
+    return next()
+  })
+  await assemble(ctx, { model: 'deepseek-flash', messages: [], purpose: 'headers-probe' })
+  expect(seen).toEqual([{ provider: 'deepseek', model: 'deepseek-flash', baseURL: server.url, purpose: 'headers-probe' }])
 })
 
 it('uses the prepared endpoint and isolates overlapping requests', async () => {

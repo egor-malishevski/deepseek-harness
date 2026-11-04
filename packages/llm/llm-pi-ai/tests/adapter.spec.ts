@@ -12,6 +12,7 @@ import type {
 import LlmRuntime, { createToolResultMessage, createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, ReasoningEffortId, userAgent } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
+import type { PiAiAdapterOptions } from '@deepseek-ai/dsh-llm-pi-ai'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM, DEFAULT_MAX_REQUEST_IMAGE_BYTES, DEFAULT_MAX_REQUEST_IMAGES, resolveProfiles } from '../src/config.ts'
@@ -1043,6 +1044,56 @@ describe('provider profile lifecycle', () => {
       providers: { openai: { retryPolicy: { mode: 'normal', maxRetries: -1 } } },
     })).rejects.toThrow(/retryPolicy/)
     expect(ctx.llm.listProviders()).toEqual([])
+  })
+
+  describe('first-listing retry on a discovering route', () => {
+    const gateway: Record<string, LlmPiAi.PiAiProviderProfile> = {
+      gw: { api: 'openai-completions', baseURL: 'https://gw.test', discoverModels: true, models: [{ id: 'seed' }] },
+    }
+    /** Adapter whose route learns `late` only once its listing has been awaited. */
+    function lateAdapter(ensureListing: PiAiAdapterOptions['ensureListing']): PiAiAdapter {
+      let listing: { id: string }[] | undefined
+      return new PiAiAdapter({
+        profiles: () => resolveProfiles(gateway, 'deferred', listing === undefined ? undefined : new Map([['gw', listing]])),
+        resolveApiKey: () => Promise.resolve('test-key'),
+        auth: memoryAuth(),
+        ...ensureListing === undefined ? {} : {
+          ensureListing: async (provider, signal) => {
+            await ensureListing(provider, signal)
+            listing = [{ id: 'late' }]
+          },
+        },
+      })
+    }
+
+    it('awaits the listing once for an unknown model, then resolves it', async () => {
+      const ensure = vi.fn(() => Promise.resolve())
+      const adapter = lateAdapter(ensure)
+      await expect(adapter.resolveModel('gw', 'late')).resolves.toMatchObject({ id: 'late' })
+      expect(ensure).toHaveBeenCalledTimes(1)
+      await expect(adapter.prepareCall('gw', 'late')).resolves.toBeDefined()
+      expect(ensure).toHaveBeenCalledTimes(1)
+    })
+
+    it('still refuses a model the loaded listing does not know, without a second wait', async () => {
+      const ensure = vi.fn(() => Promise.resolve())
+      const adapter = lateAdapter(ensure)
+      await expect(adapter.prepareCall('gw', 'never')).rejects.toMatchObject({ code: 'UNKNOWN_MODEL' })
+      expect(ensure).toHaveBeenCalledTimes(1)
+      await expect(adapter.prepareCall('gw', 'never')).rejects.toMatchObject({ code: 'UNKNOWN_MODEL' })
+      expect(ensure).toHaveBeenCalledTimes(1)
+    })
+
+    it('refuses immediately when the adapter was given no listing hook', async () => {
+      await expect(lateAdapter(undefined).resolveModel('gw', 'late')).rejects.toMatchObject({ code: 'UNKNOWN_MODEL' })
+    })
+
+    it('does not retry other failures', async () => {
+      const ensure = vi.fn(() => Promise.resolve())
+      const adapter = lateAdapter(ensure)
+      await expect(adapter.resolveModel('other', 'x')).rejects.toMatchObject({ code: 'NO_ADAPTER' })
+      expect(ensure).not.toHaveBeenCalled()
+    })
   })
 
   it('constructs the adapter directly and rejects routes it does not own', async () => {

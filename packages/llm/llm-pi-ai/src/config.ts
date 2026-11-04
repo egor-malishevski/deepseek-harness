@@ -20,12 +20,13 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
-import type { ResolvedRetryPolicy, RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
+import type { LlmDiscoveredModel, ResolvedRetryPolicy, RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import {
   CACHE_CONTROL_FORMATS,
   CHAT_TEMPLATE_VARS,
   MAX_TOKENS_FIELDS,
+  listingEndpoint,
   MODALITIES,
   PiAiCatalogError,
   resolveRouteModels,
@@ -41,6 +42,7 @@ import type {
   PiAiReasoningEfforts,
   RouteCatalog,
 } from './catalog.ts'
+import { LISTABLE_PROTOCOLS } from './discovery.ts'
 import { buildProvider, supportedProtocols } from './provider.ts'
 
 /** Default maximum idle interval while an adapter stream read is outstanding. */
@@ -161,6 +163,26 @@ export interface PiAiProviderProfile {
    * to answer instead.
    */
   defaultInput?: PiAiModality[]
+  /**
+   * Follow the endpoint's `GET {baseURL}/models` listing instead of relying on
+   * `models` alone (default false). The listing, in its own order, decides
+   * which models are offered; `models` entries become metadata seed matched by
+   * id (seed fields win, the listing fills unset name and capacities), and a
+   * seed entry the listing omits stays resolvable but is not offered. A listed
+   * id without a seed entry takes the route defaults and does not reason.
+   * Requires `openai-completions`, `openai-responses`, or `anthropic-messages`
+   * and a resolvable `baseURL`; `models` may then be empty. Before the first
+   * listing loads, and while the endpoint fails, the seed is served.
+   */
+  discoverModels?: boolean
+  /** Deadline of one listing request and of a first-use wait, in milliseconds (default 5,000). Only read with {@link discoverModels}. */
+  modelsTimeoutMs?: number
+  /**
+   * Interval between automatic listing refreshes, in milliseconds (default
+   * 600,000). Zero refreshes on each access and runs no timer. Only read with
+   * {@link discoverModels}.
+   */
+  modelsMaxAgeMs?: number
   /** Provider request headers, validated against Fetch when the profile resolves; Harness attribution wins reserved names. */
   headers?: Record<string, string>
   /** Provider-neutral pi-ai reasoning level. */
@@ -207,9 +229,26 @@ export interface PiAiProviderProfile {
   retryPolicy?: RetryPolicyConfig
 }
 
+/** Default deadline of one model-listing request and of a first-use wait. */
+export const DEFAULT_MODELS_TIMEOUT_MS = 5_000
+/** Default interval between automatic listing refreshes. */
+export const DEFAULT_MODELS_MAX_AGE_MS = 600_000
+
+/** Where and how often one discovering route reads its listing. */
+export interface ResolvedModelDiscovery {
+  /** Wire protocol of the listing request; always listable. */
+  readonly api: string
+  /** Endpoint base the listing path is appended to. */
+  readonly baseURL: string
+  /** Deadline of one listing request. */
+  readonly timeoutMs: number
+  /** Listing age after which the next access refreshes it; zero refreshes on each access. */
+  readonly maxAgeMs: number
+}
+
 /** Validated profile with its route stamped and every adapter-owned default resolved. */
 export interface ResolvedPiAiProviderProfile
-  extends Omit<PiAiProviderProfile, 'apiKeyEnv' | 'retryPolicy' | 'models' | 'displayName'> {
+  extends Omit<PiAiProviderProfile, 'apiKeyEnv' | 'retryPolicy' | 'models' | 'displayName' | 'discoverModels'> {
   /** Harness route key and the `Models` collection key (the configuration dict key). */
   provider: string
   /** Resolved display name for selectors and configuration surfaces. */
@@ -239,6 +278,15 @@ export interface ResolvedPiAiProviderProfile
   catalogError?: string
   /** Per-model failures reported before attempting a request. */
   modelErrors: ReadonlyMap<string, string>
+  /**
+   * Ids a discovering route offers, in listing order; `undefined` offers every
+   * resolvable model (no discovery, or no listing loaded yet).
+   */
+  offered: ReadonlySet<string> | undefined
+  /** Listed models that could not be materialized and were skipped. */
+  listingProblems: readonly string[]
+  /** Listing request settings; present exactly when {@link PiAiProviderProfile.discoverModels} is on. */
+  discovery?: ResolvedModelDiscovery
   /**
    * Per-request output caps this profile explicitly configured, by model id.
    * The seam materializes one only into a request that names no cap of its
@@ -363,6 +411,9 @@ const profile = z.object({
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
   defaultMaxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
   defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),
+  discoverModels: z.boolean().default(false),
+  modelsTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_MODELS_TIMEOUT_MS),
+  modelsMaxAgeMs: z.number().step(1).min(0).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MODELS_MAX_AGE_MS),
   headers: z.dict(z.string()),
   reasoning: z.union(THINKING_LEVELS),
   thinkingBudgets,
@@ -436,11 +487,13 @@ function assertValidHeaders(provider: string, headers: Readonly<Record<string, s
  * routes. An omitted dict resolves to the empty, dormant route set.
  * @param providers - configured provider profiles keyed by route.
  * @param validation - writes require a complete catalog; stored reads retain catalog diagnostics.
+ * @param listings - loaded model listings keyed by route; only routes with `discoverModels` read their entry.
  * @returns validated profiles in configuration order.
  */
 export function resolveProfiles(
   providers: Readonly<Record<string, PiAiProviderProfile>> | undefined,
   validation: 'strict' | 'deferred' = 'strict',
+  listings?: ReadonlyMap<string, readonly LlmDiscoveredModel[]>,
 ): Map<string, ResolvedPiAiProviderProfile> {
   if (Array.isArray(providers)) {
     throw new Error('llm-pi-ai: providers is now a dict keyed by provider route, not an array of profiles')
@@ -485,6 +538,31 @@ export function resolveProfiles(
     if (!Number.isSafeInteger(requestImageMaxBytes) || requestImageMaxBytes <= 0) {
       throw new Error(`llm-pi-ai: provider "${provider}" requestImageMaxBytes must be a positive safe integer`)
     }
+    const modelsTimeoutMs = source.modelsTimeoutMs ?? DEFAULT_MODELS_TIMEOUT_MS
+    if (!Number.isFinite(modelsTimeoutMs) || modelsTimeoutMs <= 0 || modelsTimeoutMs > MAX_TIMER_DELAY_MS) {
+      throw new Error(
+        `llm-pi-ai: provider "${provider}" modelsTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`,
+      )
+    }
+    const modelsMaxAgeMs = source.modelsMaxAgeMs ?? DEFAULT_MODELS_MAX_AGE_MS
+    if (!Number.isSafeInteger(modelsMaxAgeMs) || modelsMaxAgeMs < 0) {
+      throw new Error(`llm-pi-ai: provider "${provider}" modelsMaxAgeMs must be a non-negative safe integer`)
+    }
+    const discover = source.discoverModels === true
+    let discovery: ResolvedModelDiscovery | undefined
+    if (discover) {
+      const endpoint = listingEndpoint(provider, source.api, source.baseURL)
+      if (endpoint.api === undefined || !LISTABLE_PROTOCOLS.has(endpoint.api)) {
+        throw new Error(
+          `llm-pi-ai: provider "${provider}" sets discoverModels, which needs api to be one of`
+          + ` ${[...LISTABLE_PROTOCOLS].join(', ')}; ${endpoint.api === undefined ? 'set api' : `"${endpoint.api}" has no readable listing`}`,
+        )
+      }
+      if (endpoint.baseURL === undefined) {
+        throw new Error(`llm-pi-ai: provider "${provider}" sets discoverModels, which needs a baseURL to read /models from`)
+      }
+      discovery = { api: endpoint.api, baseURL: endpoint.baseURL, timeoutMs: modelsTimeoutMs, maxAgeMs: modelsMaxAgeMs }
+    }
     // Detached from the configuration object because pi-ai types `Model.input`
     // mutable. The schema's explicit default covers an absent key, so an empty
     // list here is always one someone typed — and unlike an entry's, nothing
@@ -498,6 +576,7 @@ export function resolveProfiles(
     // always shown route keys, and a catalog route must not silently rename
     // itself on every configuration surface just because it gained a profile.
     const displayName = source.displayName ?? provider
+    const listing = listings?.get(provider)
     let catalog: RouteCatalog | undefined
     let piProvider: Provider | undefined
     let catalogError: string | undefined
@@ -512,6 +591,8 @@ export function resolveProfiles(
         defaultInput,
         defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
         defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
+        discover,
+        ...listing === undefined ? {} : { listing },
       }, validation)
       catalogError = catalog.modelErrors.values().next().value
       piProvider = buildProvider({
@@ -526,7 +607,7 @@ export function resolveProfiles(
       if (validation === 'strict' || !(error instanceof PiAiCatalogError)) throw error
       catalogError ??= error.message
     }
-    const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source
+    const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, discoverModels: _discover, ...rest } = source
     resolved.set(provider, {
       ...rest,
       provider,
@@ -543,6 +624,9 @@ export function resolveProfiles(
       ...rest.thinkingBudgets === undefined ? {} : { thinkingBudgets: { ...rest.thinkingBudgets } },
       configuredMaxTokens: catalog?.configuredMaxTokens ?? new Map(),
       modelErrors: catalog?.modelErrors ?? new Map(),
+      offered: catalog?.offered,
+      listingProblems: catalog?.listingProblems ?? [],
+      ...discovery === undefined ? {} : { discovery },
       ...piProvider === undefined ? {} : { piProvider },
       ...catalogError === undefined ? {} : { catalogError },
     })

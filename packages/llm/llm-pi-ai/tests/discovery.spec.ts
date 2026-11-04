@@ -6,7 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { userAgent } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
-import { discoverModels } from '../src/discovery.ts'
+import { discoverModels, fetchModelListing, LISTABLE_PROTOCOLS } from '../src/discovery.ts'
 
 const servers: Server[] = []
 /** Credential variables a test set, cleared so the next one starts unset. */
@@ -547,5 +547,54 @@ describe('recorded provider listings', () => {
     const ctx = await harness()
 
     await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: server.url, api })).resolves.toEqual(models)
+  })
+})
+
+describe('fetchModelListing', () => {
+  it('sends route headers and a bearer key, no anthropic-version, and parses the data array', async () => {
+    const server = await listingServer({ body: JSON.stringify({ object: 'list', data: [{ id: 'gpt-5', object: 'model', owned_by: 'x' }, { id: 'b' }] }) })
+
+    await expect(fetchModelListing({
+      api: 'openai-completions',
+      baseURL: `${server.url}/v1/`,
+      headers: { 'X-Tenant': 'acme', Authorization: 'Bearer from-headers' },
+      signal: AbortSignal.timeout(5000),
+    })).resolves.toEqual([{ id: 'gpt-5', name: 'gpt-5' }, { id: 'b', name: 'b' }])
+
+    expect(server.paths).toEqual(['/v1/models'])
+    expect(server.headers[0]?.['x-tenant']).toBe('acme')
+    // Headers alone authenticate when no key is given.
+    expect(server.headers[0]?.authorization).toBe('Bearer from-headers')
+    expect(server.headers[0]?.['anthropic-version']).toBeUndefined()
+    expect(server.headers[0]?.['user-agent']).toBe(userAgent())
+    expect(server.headers[0]?.['user-agent']).not.toMatch(/^claude-cli/)
+  })
+
+  it('lets an explicit key win over a header and sends anthropic-version only on anthropic-messages', async () => {
+    const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
+
+    await fetchModelListing({ api: 'openai-responses', baseURL: server.url, headers: { Authorization: 'Bearer old' }, apiKey: 'k1' })
+    await fetchModelListing({ api: 'anthropic-messages', baseURL: server.url, apiKey: 'k2' })
+
+    expect(server.headers[0]?.authorization).toBe('Bearer k1')
+    expect(server.headers[0]?.['anthropic-version']).toBeUndefined()
+    expect(server.headers[1]?.['x-api-key']).toBe('k2')
+    expect(server.headers[1]?.['anthropic-version']).toBe('2023-06-01')
+  })
+
+  it('reports an unreachable endpoint and a refusing one distinctly', async () => {
+    const refusing = await listingServer({ status: 503 })
+    await expect(fetchModelListing({ api: 'openai-completions', baseURL: refusing.url })).rejects.toThrow(/answered 503/)
+    await expect(fetchModelListing({ api: 'openai-completions', baseURL: 'http://127.0.0.1:1' })).rejects.toThrow(/could not reach/)
+  })
+
+  it('leaves draft discovery unchanged: the same request through discoverModels', async () => {
+    const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
+    await expect(discoverModels({ baseURL: server.url, api: 'openai-completions', apiKey: 'k' })).resolves.toEqual([{ id: 'm', name: 'm' }])
+    expect(server.headers[0]?.authorization).toBe('Bearer k')
+  })
+
+  it('exports the listable protocols', () => {
+    expect([...LISTABLE_PROTOCOLS].sort()).toEqual(['anthropic-messages', 'openai-completions', 'openai-responses'])
   })
 })

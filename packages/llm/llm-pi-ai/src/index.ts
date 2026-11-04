@@ -50,6 +50,20 @@
  *               off:
  *               high: high
  *               max: ultra
+ *       # Gateway whose served models change over time: GET {baseURL}/models
+ *       # decides what is offered; `models` is optional metadata seed by id.
+ *       cliproxy:
+ *         displayName: CLIProxyAPI
+ *         api: openai-completions
+ *         baseURL: http://127.0.0.1:8317/v1
+ *         headers:
+ *           Authorization: Bearer local-proxy-key
+ *         discoverModels: true
+ *         modelsTimeoutMs: 5000
+ *         modelsMaxAgeMs: 600000
+ *         models:
+ *           - id: gpt-5
+ *             contextWindow: 400000
  * ```
  *
  * @module @deepseek-ai/dsh-llm-pi-ai
@@ -61,16 +75,17 @@ import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type { Context } from '@deepseek-ai/cordis'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { assertUsableApiKey, LlmError, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm'
-import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider } from '@deepseek-ai/dsh-llm'
+import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider, LlmDiscoveredModel } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-fs'
 import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import { PiAiAdapter } from './adapter.ts'
 import { authContextFrom, credentialStoreFrom } from './auth.ts'
 import { catalogProvider, catalogProviderIds } from './catalog.ts'
-import { assertServiceable, Config, resolveProfiles } from './config.ts'
+import { assertServiceable, Config, DEFAULT_MODELS_MAX_AGE_MS, DEFAULT_MODELS_TIMEOUT_MS, resolveProfiles } from './config.ts'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
-import { discoverModels } from './discovery.ts'
-import type { StoredModelDiscoveryProfile } from './discovery.ts'
+import { discoverModels, fetchModelListing } from './discovery.ts'
+import type { ModelListingRequest, StoredModelDiscoveryProfile } from './discovery.ts'
+import { RouteListingCache } from './listing.ts'
 import { registerPiAiFlows } from './login.ts'
 import { providerDefaultsOf } from './provider-data.ts'
 import type { PiAiRequestHeaderContext } from './types.ts'
@@ -176,11 +191,18 @@ export function apply(ctx: Context, config: Config): void {
   ctx.inject(['settings'], (child) => { child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)) })
   const settingsNs = ctx.fiber.entry?.options.id ?? NS
   let lastRaw: ReturnType<Config['providers']['get']> | undefined
+  let lastVersion = -1
   let memoized: ReadonlyMap<string, ResolvedPiAiProviderProfile> | undefined
+  /** Bumped only when some route's listing actually changes, so the profiles memo rebuilds then and not otherwise. */
+  let listingsVersion = 0
+  /** One cache per route with `discoverModels` on; owned by this apply closure and disposed with it. */
+  const listings = new Map<string, RouteListingCache>()
   /**
    * The resolved profiles for the current configuration, memoized by the raw
-   * snapshot's identity — which is also what makes the adapter's own snapshot
-   * stable across operations that observe no change.
+   * snapshot's identity and the listings version — which is also what makes
+   * the adapter's own snapshot stable across operations that observe no
+   * change, and rebuild it when a listing changes. Operations that captured
+   * an earlier snapshot keep it.
    *
    * Catalog diagnostics stay in the snapshot beside serviceable models, so
    * stored configuration remains visible after an installed catalog changes.
@@ -188,9 +210,15 @@ export function apply(ctx: Context, config: Config): void {
    */
   const profiles = (): ReadonlyMap<string, ResolvedPiAiProviderProfile> => {
     const raw = config.providers.get()
-    if (raw === lastRaw && memoized !== undefined) return memoized
-    const next = resolveProfiles(structuredClone(raw) as import('./config.ts').Options['providers'], 'deferred')
+    if (raw === lastRaw && lastVersion === listingsVersion && memoized !== undefined) return memoized
+    const loaded = new Map<string, readonly LlmDiscoveredModel[]>()
+    for (const [route, cache] of listings) {
+      const current = cache.current()
+      if (current !== undefined) loaded.set(route, current)
+    }
+    const next = resolveProfiles(structuredClone(raw) as import('./config.ts').Options['providers'], 'deferred', loaded)
     lastRaw = raw
+    lastVersion = listingsVersion
     memoized = next
     return next
   }
@@ -231,6 +259,77 @@ export function apply(ctx: Context, config: Config): void {
     )
   }
 
+  /**
+   * The listing request one route sends now, or `undefined` while its named
+   * credential is missing (no listing is attempted then). An absent
+   * `apiKeyEnv` sends no key: the route's headers alone authenticate.
+   */
+  const listingRequest = async (route: string): Promise<ModelListingRequest | undefined> => {
+    const profile = profiles().get(route)
+    /* v8 ignore next -- a scheduled access can only race the disposal of a route that just lost `discoverModels`. */
+    if (profile?.discovery === undefined) return undefined
+    let apiKey: string | undefined
+    try { apiKey = await resolveApiKey(route, profile) }
+    catch (error) {
+      if (error instanceof LlmError && error.code === 'MISSING_CREDENTIAL') return undefined
+      throw error
+    }
+    return {
+      api: profile.discovery.api,
+      baseURL: profile.discovery.baseURL,
+      headers: { ...profile.headers },
+      ...apiKey === undefined ? {} : { apiKey },
+    }
+  }
+  const createListing = (route: string): RouteListingCache => new RouteListingCache({
+    settings: () => {
+      const discovery = profiles().get(route)?.discovery
+      /* v8 ignore next -- the fallbacks only apply to a route that lost `discoverModels` while its cache was being disposed. */
+      return { timeoutMs: discovery?.timeoutMs ?? DEFAULT_MODELS_TIMEOUT_MS, maxAgeMs: discovery?.maxAgeMs ?? DEFAULT_MODELS_MAX_AGE_MS }
+    },
+    request: () => listingRequest(route),
+    load: (request, signal) => fetchModelListing({ ...request, signal }),
+    now: () => Date.now(),
+    info: (message) => { ctx.logger.debug(`llm-pi-ai: ${message}`) },
+    warn: (message) => { ctx.logger.warn(`llm-pi-ai: route "${route}": ${message}`) },
+    changed: (previous, next) => {
+      listingsVersion += 1
+      if (previous !== undefined && next !== undefined) {
+        const kept = new Set(next.map(model => model.id))
+        for (const { id } of previous) {
+          if (!kept.has(id)) {
+            ctx.logger.warn(`llm-pi-ai: route "${route}" no longer advertises "${id}"; selections naming it are refused until it returns`)
+          }
+        }
+      }
+      ctx.emit('llm/models-updated', route)
+    },
+  })
+  /**
+   * Create a listing cache for each route that opted in, dispose those of
+   * routes that did not, and let every live one notice a changed endpoint or
+   * credential. The first load starts here without blocking: until it
+   * settles, the configured models are served.
+   */
+  const ensureListings = (): void => {
+    const current = profiles()
+    for (const [route, cache] of listings) {
+      if (current.get(route)?.discovery !== undefined) continue
+      listings.delete(route)
+      void cache.dispose()
+      listingsVersion += 1
+    }
+    for (const [route, profile] of current) {
+      if (profile.discovery === undefined) continue
+      let cache = listings.get(route)
+      if (cache === undefined) {
+        cache = createListing(route)
+        listings.set(route, cache)
+      }
+      void cache.access()
+    }
+  }
+  ctx.effect(() => () => Promise.all([...listings.values()].map(cache => cache.dispose())).then(() => { listings.clear() }), 'llm-pi-ai: model listings')
   // One store and one ambient context for the whole plugin instance: both read
   // through `ctx` per call, so they stay correct across the collection rebuilds
   // a configuration change causes, and a sign-in survives one.
@@ -239,6 +338,8 @@ export function apply(ctx: Context, config: Config): void {
     profiles,
     resolveApiKey,
     auth,
+    /* v8 ignore next -- the adapter asks only for discovering routes, whose cache the volatile-update handler creates. */
+    ensureListing: (route, signal) => listings.get(route)?.access(signal) ?? Promise.resolve(),
     prepareHeaders: (request, headers) => ctx.waterfall('llm-pi-ai/request-headers', request, headers, () => headers),
     resolveAttachments: () => ctx.get('attachments'),
     resolveImageAccess: (attachments, ref) => resolveImageAttachmentAccess(
@@ -333,9 +434,10 @@ export function apply(ctx: Context, config: Config): void {
     registeredFacts = facts
   }
   ensureRegistrationFacts()
+  ensureListings()
 
   ctx.on('loader/volatile-update', () => {
-    try { ensureRegistrationFacts(); ensureDirectory() }
+    try { ensureListings(); ensureRegistrationFacts(); ensureDirectory() }
     catch (error) {
       ctx.logger.error('llm-pi-ai: configuration conflicts with an existing provider route')
       ctx.logger.error(error)

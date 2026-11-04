@@ -82,6 +82,9 @@ kind: "package-reference"
 | `baseURL` | 目录端点 | 路由上所有模型的端点 |
 | `models` | 已安装目录 | 整体替换路由目录；每个条目从已安装模型取默认值 |
 | `modelOverrides` | 无 | 重塑个别已安装目录模型，而不替换其余模型 |
+| `discoverModels` | `false` | 跟随端点的 `GET {baseURL}/models` 列表；`models` 变为元数据种子（见[跟随实时模型列表](#follow-a-live-model-listing)） |
+| `modelsTimeoutMs` | `5000` | 单次列表请求以及首次等待列表的截止时间；仅在 `discoverModels` 开启时读取 |
+| `modelsMaxAgeMs` | `600000` | 后台刷新列表的间隔；`0` 表示每次访问都刷新且不运行定时器；仅在 `discoverModels` 开启时读取 |
 | `compat` | 目录检测 | 无法识别端点的协议兼容开关 |
 | `defaultContextWindow` | `1,000,000` | 未描述模型的容量回退 |
 | `defaultMaxTokens` | `128,000` | 未描述模型的输出上限回退 |
@@ -102,6 +105,35 @@ pi-ai 提供登录的提供方可以通过 harness 授权 seam 登录：流程�
 
 profile 的 `models` 列表会替换而非扩展路由的已安装目录；每个条目从同 id 已安装模型取未设置字段的默认值，因此把路由收窄到两个模型、修正一个容量或添加比已安装目录更新的模型都是一行编辑。`modelOverrides` 无需该代价即可重塑个别已安装目录模型——修正一个模型，保留其余三十七个——当它与 `models` 列表并存、位于手工声明路由上、或点名目录未描述的模型时会被拒绝，因为静默不变的模型会成为别人日后寻找的拼写错误。
 
+<a id="follow-a-live-model-listing"></a>
+### 跟随实时模型列表
+
+服务模型会随时间变化的网关可以通过 `discoverModels: true` 选择启用。该路由随后读取 `GET {baseURL}/models`，列表按其自身顺序决定选择器提供哪些模型。路由需要把 `api` 设为 `openai-completions`、`openai-responses` 或 `anthropic-messages`，并有可解析的 `baseURL`；其他协议会在 profile 写入处被拒绝。未设置该键的路由行为与以前完全一致。
+
+```yaml
+- name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      cliproxy:
+        displayName: CLIProxyAPI
+        api: openai-completions
+        baseURL: http://127.0.0.1:8317/v1
+        headers:
+          Authorization: Bearer local-proxy-key
+        discoverModels: true
+        modelsTimeoutMs: 5000
+        modelsMaxAgeMs: 600000
+        models:
+          - id: gpt-5
+            contextWindow: 400000
+```
+
+`models` 条目成为按 id 匹配的元数据种子：种子字段优先，列表提供的名称、上下文窗口与输出上限只填补种子未设置的字段。没有种子条目的列表 id 采用路由的 `defaultInput`（text）、`defaultContextWindow` 与 `defaultMaxTokens`，且不启用推理。`models: []` 仅在开启 `discoverModels` 的路由上被接受。无法物化的列表条目会被跳过并记录日志，不会把路由配置标记为损坏。
+
+列表未提及的种子条目仍可解析，因此点名它的角色和进行中的会话继续工作，但选择器不再提供它，发送闸门也会拒绝对它的新选择，直到列表再次提及。首次列表加载之前、端点失败期间或端点返回空列表时，路由使用最近一次成功的列表，没有时使用种子；每个连续失败区间只记录一条警告。路由的首次 `listModels` 最多等待 `modelsTimeoutMs`，之后的读取立即返回，并在列表达到 `modelsMaxAgeMs` 时启动后台刷新。列表变化会发出 `llm/models-updated` 以重新加载选择器，消失的模型会记录一条警告。
+
+列表请求携带路由的 `headers` 与其 `apiKeyEnv` 凭据，格式为 `Authorization: Bearer`（`anthropic-messages` 上为 `x-api-key`）；没有 `apiKeyEnv` 的路由仅靠标头认证，凭据引用解析为空的路由不读取列表。`anthropic-version` 只在 `anthropic-messages` 上发送，因为 CLIProxyAPI 看到该标头或 `claude-cli` 用户代理时会返回不同的响应格式并重命名 id。端点、协议、标头或密钥的变化会丢弃已持有的列表。
+
 ### 带推理（reasoning）与协议兼容运行
 
 `reasoningEfforts` 声明模型可选择的 thinking 等级：每个键都是选择器提供的等级，其值是分派时在协议中发送的拼写，因此 `max: ultra` 可以为拥有自有词汇的网关重命名等级。省略该字段时保留已安装目录条目的能力；`false` 声明非推理模型。对于 pi-ai 无法识别的端点，`compat` 开关重塑请求——哪个角色携带系统提示词、哪个字段限制输出、thinking 等级如何传递——可逐路由、逐模型配置。条目与已安装目录都没有尺寸的模型，会采用路由的 `defaultContextWindow` 与 `defaultMaxTokens` 回退值。
@@ -116,11 +148,11 @@ profile 的 `models` 列表会替换而非扩展路由的已安装目录；每�
 
 ### 从端点发现模型
 
-插件会回答「该提供方可以提供哪些模型？」，供配置界面正在编辑或起草的路由使用。已安装目录提供的路由直接由目录回答，不发网络请求，并将其 `input` 数组保留为发现结果的 `inputModalities`；只有目录未描述的路由才会经网络询问。`openai-completions` 与 `openai-responses` 使用带 bearer 鉴权的 `GET {baseURL}/models`，`anthropic-messages` 则以 `x-api-key` 和 `anthropic-version` 使用原生 `GET /v1/models?limit=1000` 语义；其列表 URL 接受带或不带末尾 `/v1` 的 API 根地址，因为网关文档两种写法都会发布，且只有该列表 URL 会归一化这一段，模型请求收到的仍是配置原样的 `baseURL`。已配置且具名的路由会在 Host 内部提供已存凭据与 profile `headers`，因此通过 `cordis.patch.yml` 或 Cordis 配置设置的部署标头可以到达模型发现请求，但不会成为发现请求或 Models 页面的字段；表单中新键入的密钥仍优先于已存凭据。解析器接受标准 `data` 数组或富信息 `models` 对象，并归一化每个候选的 id、显示名、上下文窗口与最大输出 token 数；Anthropic 的 `max_input_tokens` 与 `max_tokens` 会进入相同容量字段，即使对象条目点名了另一个规范 id，对象键仍是请求 id，原始类型的对象属性会被忽略，缺失的显示名则回退到该请求 id。回答是界面可以提供给用户采纳的候选元数据——不存储任何内容，`cordis.patch.yml` 仍然是决定路由服务内容的唯一事实。
+插件会回答「该提供方可以提供哪些模型？」，供配置界面正在编辑或起草的路由使用。已安装目录提供的路由直接由目录回答，不发网络请求，并将其 `input` 数组保留为发现结果的 `inputModalities`；只有目录未描述的路由才会经网络询问。`openai-completions` 与 `openai-responses` 使用带 bearer 鉴权的 `GET {baseURL}/models`，`anthropic-messages` 则以 `x-api-key` 和 `anthropic-version` 使用原生 `GET /v1/models?limit=1000` 语义；其列表 URL 接受带或不带末尾 `/v1` 的 API 根地址，因为网关文档两种写法都会发布，且只有该列表 URL 会归一化这一段，模型请求收到的仍是配置原样的 `baseURL`。已配置且具名的路由会在 Host 内部提供已存凭据与 profile `headers`，因此通过 `cordis.patch.yml` 或 Cordis 配置设置的部署标头可以到达模型发现请求，但不会成为发现请求或 Models 页面的字段；表单中新键入的密钥仍优先于已存凭据。解析器接受标准 `data` 数组或富信息 `models` 对象，并归一化每个候选的 id、显示名、上下文窗口与最大输出 token 数；Anthropic 的 `max_input_tokens` 与 `max_tokens` 会进入相同容量字段，即使对象条目点名了另一个规范 id，对象键仍是请求 id，原始类型的对象属性会被忽略，缺失的显示名则回退到该请求 id。回答是界面可以提供给用户采纳的候选元数据——不存储任何内容，`cordis.patch.yml` 仍然是决定路由服务内容的唯一事实。开启 `discoverModels` 的路由通过同一段请求代码读取同一端点，得到自己的内存列表（[跟随实时模型列表](#follow-a-live-model-listing)）；该列表同样不会写入磁盘。
 
 ### 失败与恢复
 
-pi-ai 不提供的路由需要 `api`、`baseURL` 与非空 `models` 列表；无法服务的 profile 会在写入处被拒绝，并点名路由与模型。失败携带稳定 code：无法使用的凭据以 `INVALID_CREDENTIAL` 失败并点名路由与引用，`apiKeyEnv` 引用解析为空的路由以 `MISSING_CREDENTIAL` 失败，未配置模型以 `UNKNOWN_MODEL` 失败，终止性提供方失败则区分 `QUOTA` 与暂时性 `RATE_LIMIT`。`GenerateOptions.stop` 以 `UNSUPPORTED_OPTION` 被拒绝，因为 pi-ai 的通用流式 UI 无法跨提供方保证它。
+pi-ai 不提供的路由需要 `api`、`baseURL` 与非空 `models` 列表（开启 `discoverModels` 的路由除外，其 `models` 可为空）；无法服务的 profile 会在写入处被拒绝，并点名路由与模型。失败携带稳定 code：无法使用的凭据以 `INVALID_CREDENTIAL` 失败并点名路由与引用，`apiKeyEnv` 引用解析为空的路由以 `MISSING_CREDENTIAL` 失败，未配置模型以 `UNKNOWN_MODEL` 失败，终止性提供方失败则区分 `QUOTA` 与暂时性 `RATE_LIMIT`。`GenerateOptions.stop` 以 `UNSUPPORTED_OPTION` 被拒绝，因为 pi-ai 的通用流式 UI 无法跨提供方保证它。
 
 Config 更新严格验证发生变化的 provider。初始加载将已存储的目录故障保留为可编辑的 provider 诊断；未更改的故障 provider 不阻止其他编辑。可用模型仍可选择，无法解析的模型在网络 I/O 前失败。修复或删除问题配置会清除其诊断。
 
@@ -260,6 +292,8 @@ pi-ai 事件变成 harness 的推理、文本、工具调用、用量与 finish 
 - **完整替换 Config 可以移除继承的字典条目**——字段重置则恢复其继承值。
 - **`headers` 可以携带 redactor 永远看不到的凭据**——profile 解析会拒绝 Fetch 无法表示的名称与值，但该字典仍是纯字符串；以 `apiKeyEnv` 引用存储凭据。
 - **发现操作不更改已配置模型**——需显式将发现结果采纳到路由配置中。
+- **被跟随的列表不落盘**——开启 `discoverModels` 的路由只在内存中持有列表，因此离线启动时在首次列表加载前使用 `models` 种子。
+- **被跟随的列表只给出 id**——CLIProxyAPI 的 `/models` 不披露容量或模态，因此没有种子条目的列表模型采用路由默认值；需要设定大小、图片或推理时请声明种子条目。种子条目按精确 id 匹配，不支持模式匹配覆盖。
 - **Anthropic 模型发现最多读取 1,000 个模型**——请求使用 API 的最大页大小，但不会遍历 `has_more`；第一页之外的条目需要手工添加。
 - **目录外模型需要明确的协议**——目录路由保留每个模型的协议，包括 `azure` 下的两种 Azure API。混合协议目录中不存在的模型需要显式设置路由级 `api`；该设置覆盖路由上的所有模型，且必须属于受支持的自定义协议。Azure 部署名称应通过 `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` 设置，模型 ID 保持为目录中的 ID。
 - **模态声明不受校验**——声明 `image` 而其网关不支持的模型会在提示词准入后被提供方拒绝。持久图片仍留在历史中，同一误声明模型可能再次失败；切换到纯文本模型仍然可行，因为共享 LLM 运行时会针对该请求把图片引用投影为稳定文本。

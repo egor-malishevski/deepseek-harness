@@ -1,5 +1,7 @@
 /** Profile patch edits and credential updates reach the next real adapter request. */
 
+import { createServer } from 'node:http'
+import type { Server } from 'node:http'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,8 +30,14 @@ const truncatedToolCallEvents = [
 
 let root: string | undefined
 let context: Context | undefined
+/** Listing endpoints a test opened, closed with its mock servers. */
+const listeners: Server[] = []
 
 afterEach(async () => {
+  await Promise.all(listeners.splice(0).map(listener => new Promise<void>((resolve) => {
+    listener.close(() => { resolve() })
+    listener.closeAllConnections()
+  })))
   await context?.fiber.dispose()
   context = undefined
   if (root !== undefined) await rm(root, { recursive: true, force: true })
@@ -41,7 +49,7 @@ afterEach(async () => {
 /** Boot the dormant composition: a bare `llm-pi-ai` row with no config at all. */
 async function loadComposition(): Promise<{ ctx: Context; settingsPath: string }> {
   root = await mkdtemp(join(tmpdir(), 'dsh-pi-composition-'))
-  await writeFile(join(root, '.credentials.yaml'), 'version: 1\nrefs:\n  PI_COMPOSITION_KEY: key-from-store\n', { mode: 0o600 })
+  await writeFile(join(root, '.credentials.yaml'), 'version: 1\nrefs:\n  PI_COMPOSITION_KEY: key-from-store\n  PI_COMPOSITION_BLANK_KEY: "   "\n', { mode: 0o600 })
 
   const configPath = join(root, 'cordis.yml')
   await writeFile(configPath, [
@@ -187,6 +195,187 @@ describe('llm-pi-ai real dormant composition', () => {
     expect(server.headers[0]?.authorization).toBe('Bearer key-from-store')
     expect(server.headers[0]?.accept).toBe('application/json')
     expect(server.headers[0]?.['user-agent']).toBe(userAgent())
+  })
+
+  it('sends the same settings-only headers on the automatic listing of a discovering route', async () => {
+    vi.stubEnv('PI_COMPOSITION_KEY', '')
+    const server = await mockServer([{ body: JSON.stringify({ object: 'list', data: [{ id: 'acme-live', object: 'model' }] }) }])
+    const { ctx, settingsPath } = await loadComposition()
+
+    await writeFile(settingsPath, [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      acme-gateway:',
+      '        apiKeyEnv: PI_COMPOSITION_KEY',
+      '        api: openai-completions',
+      `        baseURL: ${server.url}`,
+      '        discoverModels: true',
+      '        headers:',
+      '          X-Company-Code: private-tenant',
+      '          Anthropic-Version: should-not-leak',
+      '',
+    ].join('\n'))
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['acme-gateway'])
+    }, { timeout: 5000 })
+
+    await expect(ctx.llm.listModels('acme-gateway')).resolves.toMatchObject([{ id: 'acme-live' }])
+    expect(server.paths).toEqual(['/models'])
+    expect(server.headers[0]?.['x-company-code']).toBe('private-tenant')
+    expect(server.headers[0]?.authorization).toBe('Bearer key-from-store')
+    expect(server.headers[0]?.['user-agent']).toBe(userAgent())
+    expect(server.headers[0]?.['user-agent']).not.toMatch(/^claude-cli/)
+  })
+
+  it('follows the live listing of a discovering route and keeps seeded models resolvable', async () => {
+    vi.stubEnv('PI_COMPOSITION_KEY', '')
+    // Every access refreshes at max age zero, so the endpoint answers from mutable state rather than a script.
+    let advertised = ['gpt-a', 'gpt-b']
+    const endpoint = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ data: advertised.map(id => ({ id })) }))
+    })
+    listeners.push(endpoint)
+    await new Promise<void>(resolve => endpoint.listen(0, '127.0.0.1', resolve))
+    const address = endpoint.address()
+    if (address === null || typeof address === 'string') throw new Error('no port')
+    const server = { url: `http://127.0.0.1:${address.port}` }
+    const { ctx, settingsPath } = await loadComposition()
+    const updated: string[] = []
+    ctx.on('llm/models-updated', (provider) => { updated.push(provider) })
+
+    await writeFile(settingsPath, [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      cliproxy:',
+      '        apiKeyEnv: PI_COMPOSITION_KEY',
+      '        api: openai-completions',
+      `        baseURL: ${server.url}`,
+      '        discoverModels: true',
+      '        modelsMaxAgeMs: 0',
+      '        models:',
+      '          - id: gpt-b',
+      '            name: Seeded B',
+      '          - id: seed-only',
+      '',
+    ].join('\n'))
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['cliproxy'])
+    }, { timeout: 5000 })
+
+    // The first read waits for the listing, which decides the offered set in its own order.
+    const first = await ctx.llm.listModels('cliproxy')
+    expect(first.map(model => model.id)).toEqual(['gpt-a', 'gpt-b'])
+    expect(first[1]?.name).toBe('Seeded B')
+    expect(updated).toContain('cliproxy')
+    const afterFirstLoad = updated.length
+
+    // The endpoint drops a model; the next access refreshes in the background and announces the change.
+    advertised = ['gpt-a']
+    await ctx.llm.listModels('cliproxy')
+    await vi.waitFor(() => { expect(updated.length).toBeGreaterThan(afterFirstLoad) }, { timeout: 5000 })
+    await vi.waitFor(async () => {
+      expect((await ctx.llm.listModels('cliproxy')).map(model => model.id)).toEqual(['gpt-a'])
+    }, { timeout: 5000 })
+
+    // A model the endpoint stopped advertising is not offered but still serves roles and in-flight sessions.
+    await expect(ctx.llm.prepareCall({ provider: 'cliproxy', model: 'gpt-b' })).resolves.toBeDefined()
+    await expect(ctx.llm.prepareCall({ provider: 'cliproxy', model: 'seed-only' })).resolves.toBeDefined()
+    await expect(ctx.llm.prepareCall({ provider: 'cliproxy', model: 'never-listed' })).rejects.toMatchObject({ code: 'UNKNOWN_MODEL' })
+  })
+
+  it('reads no listing while the named credential is missing, and drops the cache when discovery is turned off', async () => {
+    vi.stubEnv('PI_COMPOSITION_ABSENT_KEY', '')
+    const server = await mockServer([])
+    const { ctx, settingsPath } = await loadComposition()
+    const route = (discover: boolean, key: string, extra = ''): string => [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      cliproxy:',
+      `        apiKeyEnv: ${key}`,
+      '        api: openai-completions',
+      `        baseURL: ${server.url}`,
+      `        discoverModels: ${String(discover)}`,
+      '        models:',
+      '          - id: seed-model',
+      extra,
+    ].join('\n')
+
+    await writeFile(settingsPath, route(true, 'PI_COMPOSITION_ABSENT_KEY'))
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['cliproxy'])
+    }, { timeout: 5000 })
+    // The unresolved reference makes the route offer nothing and the listing is never requested.
+    await expect(ctx.llm.listModels('cliproxy')).resolves.toEqual([])
+
+    // A credential that resolves to something unusable is a configuration error, not a missing key.
+    await writeFile(settingsPath, route(true, 'PI_COMPOSITION_BLANK_KEY', '          - id: another-seed'))
+    await vi.waitFor(async () => {
+      await expect(ctx.llm.listModels('cliproxy')).rejects.toMatchObject({ code: 'INVALID_CREDENTIAL' })
+    }, { timeout: 5000 })
+
+    // Turning discovery off disposes the cache; the route keeps serving its seed as any other route.
+    await writeFile(settingsPath, route(false, 'PI_COMPOSITION_KEY'))
+    await vi.waitFor(async () => {
+      expect((await ctx.llm.listModels('cliproxy')).map(model => model.id)).toEqual(['seed-model'])
+    }, { timeout: 5000 })
+    expect(server.paths).toEqual([])
+    // Each settings rewrite takes about two seconds to reload through the Loader.
+  }, 30_000)
+
+  it('reads the listing of a route that names no credential with its headers alone', async () => {
+    const server = await mockServer([{ body: JSON.stringify({ data: [{ id: 'keyless-live' }] }) }])
+    const { ctx, settingsPath } = await loadComposition()
+
+    await writeFile(settingsPath, [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      cliproxy:',
+      '        api: openai-completions',
+      `        baseURL: ${server.url}`,
+      '        discoverModels: true',
+      '        headers:',
+      '          Authorization: Bearer from-headers',
+      '        models:',
+      '          - id: seed-model',
+      '',
+    ].join('\n'))
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['cliproxy'])
+    }, { timeout: 5000 })
+
+    await expect(ctx.llm.listModels('cliproxy')).resolves.toMatchObject([{ id: 'keyless-live' }, { id: 'seed-model' }].slice(0, 1))
+    expect(server.headers[0]?.authorization).toBe('Bearer from-headers')
+  })
+
+  it('serves the seed when the listing endpoint is down', async () => {
+    vi.stubEnv('PI_COMPOSITION_KEY', '')
+    const { ctx, settingsPath } = await loadComposition()
+
+    await writeFile(settingsPath, [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      cliproxy:',
+      '        apiKeyEnv: PI_COMPOSITION_KEY',
+      '        api: openai-completions',
+      '        baseURL: http://127.0.0.1:1',
+      '        discoverModels: true',
+      '        modelsTimeoutMs: 2000',
+      '        models:',
+      '          - id: seed-model',
+      '',
+    ].join('\n'))
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['cliproxy'])
+    }, { timeout: 5000 })
+
+    expect((await ctx.llm.listModels('cliproxy')).map(model => model.id)).toEqual(['seed-model'])
+    await expect(ctx.llm.prepareCall({ provider: 'cliproxy', model: 'seed-model' })).resolves.toBeDefined()
   })
 
   it('continues natively after max-token assembly drops a tool call, with pruned replay metadata', async () => {

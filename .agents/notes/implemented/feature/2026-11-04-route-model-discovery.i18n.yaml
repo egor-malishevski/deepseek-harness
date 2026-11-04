@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-11-04-route-model-discovery.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-11-04-route-model-discovery.md
+/agent-note-route-model-discovery:
+  en: 58039745e91101c4
+  zh: 2ab629b023d9edd7
+/agent-note-route-model-discovery/problem:
+  en: d85a1e0b35d71a02
+  zh: 8ef4b630608751b7
+/agent-note-route-model-discovery/decision:
+  en: a5e47896653be9cc
+  zh: 04d824278c462b36
+/agent-note-route-model-discovery/alternatives-considered:
+  en: 60a491a8c91da9ed
+  zh: 6e233f62918e1dbe
+/agent-note-route-model-discovery/consequences:
+  en: 006cad3b3d925d5a
+  zh: 56234d47b84ef961

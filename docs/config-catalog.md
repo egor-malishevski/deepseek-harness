@@ -1952,7 +1952,7 @@ export interface Config extends ProtocolConfig, ModelListingConfig {
 
 - `inject`: `llm`
 - `refs`: `Api` (`@earendil-works/pi-ai`) · `CacheRetention` (`@earendil-works/pi-ai`) · `Model` (`@earendil-works/pi-ai`) · `ModelThinkingLevel` (`@earendil-works/pi-ai`) · `OpenAICompletionsCompat` (`@earendil-works/pi-ai`) · [`RetryPolicyConfig`](../packages/llm/llm/src/index.ts) · `ThinkingBudgets` (`@earendil-works/pi-ai`) · `Transport` (`@earendil-works/pi-ai`) · `Volatile` (`@deepseek-ai/cordis`)
-- `source`: [`packages/llm/llm-pi-ai/src/config.ts:251`](../packages/llm/llm-pi-ai/src/config.ts)
+- `source`: [`packages/llm/llm-pi-ai/src/config.ts:299`](../packages/llm/llm-pi-ai/src/config.ts)
 
 ```ts config-catalog
 /** Plugin configuration: the provider routes this instance owns. */
@@ -2025,6 +2025,26 @@ export interface PiAiProviderProfile {
    * to answer instead.
    */
   defaultInput?: PiAiModality[]
+  /**
+   * Follow the endpoint's `GET {baseURL}/models` listing instead of relying on
+   * `models` alone (default false). The listing, in its own order, decides
+   * which models are offered; `models` entries become metadata seed matched by
+   * id (seed fields win, the listing fills unset name and capacities), and a
+   * seed entry the listing omits stays resolvable but is not offered. A listed
+   * id without a seed entry takes the route defaults and does not reason.
+   * Requires `openai-completions`, `openai-responses`, or `anthropic-messages`
+   * and a resolvable `baseURL`; `models` may then be empty. Before the first
+   * listing loads, and while the endpoint fails, the seed is served.
+   */
+  discoverModels?: boolean
+  /** Deadline of one listing request and of a first-use wait, in milliseconds (default 5,000). Only read with {@link discoverModels}. */
+  modelsTimeoutMs?: number
+  /**
+   * Interval between automatic listing refreshes, in milliseconds (default
+   * 600,000). Zero refreshes on each access and runs no timer. Only read with
+   * {@link discoverModels}.
+   */
+  modelsMaxAgeMs?: number
   /** Provider request headers, validated against Fetch when the profile resolves; Harness attribution wins reserved names. */
   headers?: Record<string, string>
   /** Provider-neutral pi-ai reasoning level. */

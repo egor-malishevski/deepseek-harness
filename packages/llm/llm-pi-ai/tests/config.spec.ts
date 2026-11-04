@@ -85,6 +85,54 @@ describe('modality schema boundary', () => {
   })
 })
 
+describe('model discovery keys', () => {
+  type Materialized = { providers: Record<string, Record<string, unknown>> }
+
+  it('defaults to off with the llm-deepseek timings', () => {
+    const route = (routeWith({})() as Materialized).providers['acme-gateway']!
+    expect(route['discoverModels']).toBe(false)
+    expect(route['modelsTimeoutMs']).toBe(5000)
+    expect(route['modelsMaxAgeMs']).toBe(600_000)
+  })
+
+  it('accepts an enabled route with no seed and zero max age', () => {
+    expect(routeWith({ discoverModels: true, models: [], modelsMaxAgeMs: 0 })).not.toThrow()
+    expect(() => { assertServiceable(routeWith({ discoverModels: true, models: [] })() as Options) }).not.toThrow()
+  })
+
+  it('rejects bad timings at the schema and at service resolution', () => {
+    expect(routeWith({ modelsTimeoutMs: 0 })).toThrow()
+    expect(routeWith({ modelsTimeoutMs: -1 })).toThrow()
+    expect(routeWith({ modelsMaxAgeMs: -1 })).toThrow()
+    expect(routeWith({ modelsMaxAgeMs: 1.5 })).toThrow()
+    const programmatic = (field: string, value: number): Options => ({
+      providers: { 'acme-gateway': { api: 'openai-completions', baseURL: 'https://acme.test', models: [{ id: 'm' }], [field]: value } },
+    })
+    expect(() => { assertServiceable(programmatic('modelsTimeoutMs', 0)) }).toThrow(/modelsTimeoutMs must be a positive finite number/)
+    expect(() => { assertServiceable(programmatic('modelsTimeoutMs', Number.POSITIVE_INFINITY)) }).toThrow(/modelsTimeoutMs/)
+    expect(() => { assertServiceable(programmatic('modelsMaxAgeMs', -1)) }).toThrow(/modelsMaxAgeMs must be a non-negative safe integer/)
+    expect(() => { assertServiceable(programmatic('modelsMaxAgeMs', 1.5)) }).toThrow(/modelsMaxAgeMs/)
+  })
+
+  it('requires a listable api and a resolvable baseURL', () => {
+    expect(() => resolveProfiles({ gw: { api: 'google-generative-ai', baseURL: 'https://x.test', models: [{ id: 'm' }], discoverModels: true } }))
+      .toThrow(/discoverModels.*"google-generative-ai" has no readable listing/)
+    expect(() => resolveProfiles({ gw: { baseURL: 'https://x.test', models: [{ id: 'm' }], discoverModels: true } }))
+      .toThrow(/discoverModels.*set api/)
+    expect(() => resolveProfiles({ gw: { api: 'openai-completions', models: [{ id: 'm' }], discoverModels: true } }))
+      .toThrow(/discoverModels.*needs a baseURL/)
+    // A catalog route inherits the endpoint from the installed catalog; its protocol comes from the route when the catalog mixes several.
+    expect(resolveProfiles({ openai: { api: 'openai-responses', discoverModels: true } }).get('openai')?.discovery)
+      .toMatchObject({ api: 'openai-responses', baseURL: 'https://api.openai.com/v1' })
+  })
+
+  it('allows an empty models list only with discovery on', () => {
+    expect(() => resolveProfiles({ gw: { api: 'openai-completions', baseURL: 'https://x.test', models: [] } })).toThrow(/resolves no models/)
+    expect(resolveProfiles({ gw: { api: 'openai-completions', baseURL: 'https://x.test', models: [], discoverModels: true } }).get('gw')?.piProvider?.getModels())
+      .toEqual([])
+  })
+})
+
 describe('request image policy bounds', () => {
   it.each([
     ['requestImagePixelBudget', 0, /requestImagePixelBudget must be a positive safe integer/],

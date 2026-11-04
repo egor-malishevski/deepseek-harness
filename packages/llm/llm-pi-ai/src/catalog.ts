@@ -14,6 +14,7 @@
 
 import { builtinProviders, getAllBuiltinModels, getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import type { BuiltinProvider } from '@earendil-works/pi-ai/providers/all'
+import type { LlmDiscoveredModel } from '@deepseek-ai/dsh-llm'
 import type {
   AnthropicMessagesCompat,
   Api,
@@ -668,6 +669,13 @@ export interface RouteCatalogRequest {
   defaultMaxTokens: number
   /** Modalities for a model neither the entry nor the catalog declares. */
   defaultInput: Model<Api>['input']
+  /**
+   * Whether the route follows its endpoint's `/models` listing. Then `models`
+   * is metadata seed rather than the served set, and may be empty.
+   */
+  discover?: boolean
+  /** The route's last good endpoint listing in endpoint order; `undefined` until one loads. Read only when {@link discover} is set. */
+  listing?: readonly LlmDiscoveredModel[]
 }
 
 /** An expected configuration failure that stored-catalog reads may retain for repair. */
@@ -690,6 +698,26 @@ function sharedCatalogApi(defaults: ReadonlyMap<string, Model<Api>>): string | u
   const apis = new Set<string>()
   for (const model of defaults.values()) apis.add(model.api)
   return apis.size === 1 ? [...apis][0] : undefined
+}
+
+/**
+ * The protocol and endpoint a route's model listing is read from: the route's
+ * own `api` and `baseURL`, else what the installed catalog agrees on.
+ * @param provider - route key.
+ * @param api - the route's protocol override.
+ * @param baseURL - the route's endpoint override.
+ * @returns each fact, `undefined` where neither the route nor the catalog decides it.
+ */
+export function listingEndpoint(
+  provider: string,
+  api: string | undefined,
+  baseURL: string | undefined,
+): { api: string | undefined; baseURL: string | undefined } {
+  const defaults = catalogModels(provider)
+  return {
+    api: api ?? sharedCatalogApi(defaults),
+    baseURL: baseURL ?? catalogProvider(provider)?.baseUrl ?? [...defaults.values()][0]?.baseUrl,
+  }
 }
 
 /** The reasoning fields one materialized model carries. */
@@ -844,6 +872,64 @@ export interface RouteCatalog {
    * picked, so only an explicit configuration lands here.
    */
   configuredMaxTokens: ReadonlyMap<string, number>
+  /**
+   * Ids a discovering route offers: the listed models that resolved, in
+   * listing order. `undefined` means no listing is loaded (or discovery is
+   * off), so every resolvable model is offered. Resolvable models outside this
+   * set are seed entries the listing does not name; they stay addressable for
+   * roles and in-flight sessions but are not offered.
+   */
+  offered: ReadonlySet<string> | undefined
+  /** Listed models skipped because they could not be materialized; reported, never a model diagnostic. */
+  listingProblems: readonly string[]
+}
+
+/** One entry to materialize, with where its fields came from. */
+interface ResolutionEntry {
+  entry: PiAiModelProfile
+  /** Whether the endpoint listing named this id. */
+  listed: boolean
+  /** Whether `entry.maxTokens` came from the listing, which sizes the model without becoming a request default. */
+  listedMaxTokens: boolean
+}
+
+/**
+ * The entries a discovering route resolves: listed ids in listing order, each
+ * merged over its first configured entry (configuration wins, the listing
+ * fills unset name and capacities), then every configured entry the listing
+ * did not consume, so unlisted seed models stay resolvable.
+ */
+function discoveryEntries(
+  listing: readonly LlmDiscoveredModel[],
+  seed: readonly PiAiModelProfile[],
+): ResolutionEntry[] {
+  const resolution: ResolutionEntry[] = []
+  const consumed = new Set<PiAiModelProfile>()
+  const listedIds = new Set<string>()
+  for (const listed of listing) {
+    if (listedIds.has(listed.id)) continue
+    listedIds.add(listed.id)
+    const configured = seed.find(entry => entry.id === listed.id)
+    if (configured !== undefined) consumed.add(configured)
+    const name = configured?.name ?? listed.name
+    const contextWindow = configured?.contextWindow ?? listed.contextWindow
+    const maxTokens = configured?.maxTokens ?? listed.maxTokens
+    resolution.push({
+      entry: {
+        ...configured,
+        id: listed.id,
+        ...name === undefined ? {} : { name },
+        ...contextWindow === undefined ? {} : { contextWindow },
+        ...maxTokens === undefined ? {} : { maxTokens },
+      },
+      listed: true,
+      listedMaxTokens: configured?.maxTokens === undefined && listed.maxTokens !== undefined,
+    })
+  }
+  for (const entry of seed) {
+    if (!consumed.has(entry)) resolution.push({ entry, listed: false, listedMaxTokens: false })
+  }
+  return resolution
 }
 
 /**
@@ -851,6 +937,9 @@ export interface RouteCatalog {
  * under the configured entries. A route with no configured `models` serves the
  * installed catalog unchanged, which is what keeps an existing
  * `providers: { deepseek: { apiKeyEnv: … } }` profile working untouched.
+ * A route with `discover` set serves its endpoint listing instead: configured
+ * entries become metadata seed (see {@link discoveryEntries}) and the result's
+ * `offered` names what the listing advertises.
  * @param request - the route-level catalog facts.
  * @param validation - strict writes reject every error; deferred reads retain model diagnostics.
  * @returns the materialized models and the explicitly configured request caps.
@@ -895,10 +984,14 @@ export function resolveRouteModels(
   // An override becomes the catalog entry's configuration, so everything a
   // models entry may declare — capacities, efforts, compat — resolves through
   // the same path with the same diagnostics and request-default semantics.
-  const entries: readonly PiAiModelProfile[] = configured.length > 0
+  const seed: readonly PiAiModelProfile[] = configured.length > 0
     ? configured
     : [...defaults.values()].map(model => ({ id: model.id, ...overrides[model.id] }))
-  if (entries.length === 0) {
+  const discovering = request.discover === true
+  const resolution: readonly ResolutionEntry[] = discovering && request.listing !== undefined
+    ? discoveryEntries(request.listing, seed)
+    : seed.map(entry => ({ entry, listed: false, listedMaxTokens: false }))
+  if (resolution.length === 0 && !discovering) {
     invalid(provider, 'resolves no models; the installed catalog does not describe this route, so its models'
       + ' must be listed in configuration')
   }
@@ -909,7 +1002,7 @@ export function resolveRouteModels(
   assertOfferedCompatFields(provider, 'route', request.compat)
   const seen = new Set<string>()
   const configuredMaxTokens = new Map<string, number>()
-  const resolveEntry = (entry: PiAiModelProfile): Model<Api> => {
+  const resolveEntry = ({ entry, listedMaxTokens }: ResolutionEntry): Model<Api> => {
     assertOfferedCompatFields(provider, `model "${entry.id}"`, entry.compat)
     if (entry.id.length === 0) invalid(provider, 'has a model with an empty id')
     if (seen.has(entry.id)) invalid(provider, `lists model "${entry.id}" more than once`)
@@ -938,7 +1031,7 @@ export function resolveRouteModels(
     }
     // Only a value the profile named is a deployment choice; the catalog's is
     // the model's capability and stays out of request defaults.
-    if (entry.maxTokens !== undefined) configuredMaxTokens.set(entry.id, entry.maxTokens)
+    if (entry.maxTokens !== undefined && !listedMaxTokens) configuredMaxTokens.set(entry.id, entry.maxTokens)
     return {
       // The installed entry lays the floor, and the fields below override it.
       // Enumerating instead would silently drop every `Model` field this
@@ -960,15 +1053,25 @@ export function resolveRouteModels(
     }
   }
   const models: Model<Api>[] = []
-  for (const entry of entries) {
+  const listingProblems: string[] = []
+  const listedResolved = new Set<string>()
+  for (const item of resolution) {
     let model: Model<Api>
     try {
-      model = resolveEntry(entry)
+      model = resolveEntry(item)
     } catch (error) {
-      if (validation === 'strict' || !(error instanceof PiAiCatalogError)) throw error
-      modelErrors.set(entry.id, error.message)
+      if (!(error instanceof PiAiCatalogError)) throw error
+      // A listed id is endpoint-supplied data: it is skipped and reported, and
+      // never becomes a model diagnostic that would mark the whole route broken.
+      if (item.listed) {
+        listingProblems.push(error.message)
+        continue
+      }
+      if (validation === 'strict') throw error
+      modelErrors.set(item.entry.id, error.message)
       continue
     }
+    if (item.listed) listedResolved.add(model.id)
     models.push(model)
   }
   // A later duplicate invalidates the id, including an earlier resolved entry.
@@ -983,5 +1086,8 @@ export function resolveRouteModels(
     invalid(provider, `sets compat "${field}", but no model on the route speaks a protocol that takes it;`
       + ` it exists on ${takers.join(', ')}`)
   }
-  return { models: serviceableModels, configuredMaxTokens, modelErrors }
+  const offered = discovering && request.listing !== undefined
+    ? new Set(request.listing.map(listed => listed.id).filter(id => listedResolved.has(id)))
+    : undefined
+  return { models: serviceableModels, configuredMaxTokens, modelErrors, offered, listingProblems }
 }

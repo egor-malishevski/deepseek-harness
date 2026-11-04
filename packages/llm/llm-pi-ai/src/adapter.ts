@@ -117,6 +117,15 @@ export interface PiAiAdapterOptions {
    * @returns headers to pass to pi-ai after applying Harness attribution.
    */
   prepareHeaders?: (request: PiAiRequestHeaderContext, headers: Headers) => Headers
+  /**
+   * Bring one discovering route's model listing up to date before its models
+   * are read: returns at once once a listing has loaded, otherwise waits at
+   * most the route's `modelsTimeoutMs`, and starts a background refresh of a
+   * stale listing. Never rejects for a failed load. Omission skips discovery.
+   * @param provider - route key.
+   * @param signal - abandons this wait only.
+   */
+  ensureListing?: (provider: string, signal?: AbortSignal) => Promise<void>
   /** Resolve the optional durable attachment service at request time. */
   resolveAttachments?: () => AttachmentStore | undefined
   /** Bridge one attachment reference into the current model-tool execution world. */
@@ -334,8 +343,35 @@ export class PiAiAdapter extends LlmAdapter {
     return this.current().profiles.get(provider)?.retryPolicy
   }
 
+  /**
+   * Run `operation` on the current snapshot. A model the snapshot does not
+   * know on a discovering route that has no listing yet may only be missing
+   * because the first listing has not loaded, so the listing is awaited once
+   * (bounded by `modelsTimeoutMs`) and the operation retried on the fresh snapshot.
+   */
+  private async withListingRetry<T>(
+    provider: string,
+    signal: AbortSignal | undefined,
+    operation: (snapshot: PiAiSnapshot) => T,
+  ): Promise<T> {
+    const snapshot = this.current()
+    try {
+      return operation(snapshot)
+    } catch (error) {
+      const profile = snapshot.profiles.get(provider)
+      const awaitingListing = error instanceof LlmError && error.code === 'UNKNOWN_MODEL'
+        && profile?.discovery !== undefined && profile.offered === undefined
+        && this.config.ensureListing !== undefined
+      if (!awaitingListing) throw error
+      await this.config.ensureListing?.(provider, signal)
+      return operation(this.current())
+    }
+  }
+
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     return Promise.resolve().then(async () => {
+      // Resolves at once after the first load; otherwise waits at most modelsTimeoutMs and starts a refresh of a stale listing.
+      if (this.current().profiles.get(provider)?.discovery !== undefined) await this.config.ensureListing?.(provider)
       const snapshot = this.current()
       const profile = this.profileOf(snapshot, provider)
       try { await this.config.resolveApiKey(provider, profile) }
@@ -344,24 +380,25 @@ export class PiAiAdapter extends LlmAdapter {
         if (error instanceof LlmError && error.code === 'MISSING_CREDENTIAL') return []
         throw error
       }
-      return snapshot.models.getModels(provider).map(model => ({
-        provider,
-        id: model.id,
-        name: model.name,
-        inputModalities: [...model.input],
-      }))
+      // Listing order for a discovering route; seed entries the listing omits stay resolvable but are not offered.
+      const { offered } = profile
+      return snapshot.models.getModels(provider)
+        .filter(model => offered === undefined || offered.has(model.id))
+        .map(model => ({
+          provider,
+          id: model.id,
+          name: model.name,
+          inputModalities: [...model.input],
+        }))
     })
   }
 
   override resolveModel(
     provider: string,
     model: string,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
-    return Promise.resolve().then(() => {
-      const snapshot = this.current()
-      return this.modelInfo(snapshot, provider, model)
-    })
+    return this.withListingRetry(provider, signal, snapshot => this.modelInfo(snapshot, provider, model))
   }
 
   private modelInfo(snapshot: PiAiSnapshot, provider: string, model: string): LlmResolvedModelInfo {
@@ -383,12 +420,11 @@ export class PiAiAdapter extends LlmAdapter {
     }
   }
 
-  override prepareCall(provider: string, model: string, _signal?: AbortSignal): Promise<PreparedAdapterCall> {
-    const snapshot = this.current()
-    return Promise.resolve({
+  override prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+    return this.withListingRetry(provider, signal, snapshot => ({
       model: this.modelInfo(snapshot, provider, model),
       stream: options => this.streamWithSnapshot(options, snapshot),
-    })
+    }))
   }
 
   stream(options: GenerateOptions): AsyncIterable<StreamChunk> {

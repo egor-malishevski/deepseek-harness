@@ -122,6 +122,7 @@ const configure = (maxTokens: number): ConfigureCall =>
 | [`src/error.ts`](src/error.ts) | `HarnessError`/`LlmError` 分类体系与提供方无关失败 code |
 | [`src/content.ts`](src/content.ts) | 共享文件与图片辅助函数：内容遍历、文件投影、图片卸载计数与已卸载图片投影 |
 | [`src/api-key.ts`](src/api-key.ts) | 每个适配器共享的凭据格式校验 |
+| [`src/listing-cache.ts`](src/listing-cache.ts) | `ListingCache`：单次飞行加载、有界的首次等待、后台刷新与保留最近一次成功列表，供提供方的 `/models` 缓存继承 |
 | [`src/adapter-failure.ts`](src/adapter-failure.ts) | 把失败归一化为终止 finish 分片 |
 
 ### 主流程

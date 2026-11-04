@@ -82,6 +82,9 @@ Each profile may set a `retryPolicy`; omission uses normal mode with five retrie
 | `baseURL` | catalog endpoint | Endpoint of every model on the route |
 | `models` | installed catalog | Replaces the route's catalog wholesale; each entry defaults from the installed model |
 | `modelOverrides` | none | Reshapes individual installed-catalog models without replacing the rest |
+| `discoverModels` | `false` | Follows the endpoint's `GET {baseURL}/models` listing; `models` becomes metadata seed (see [Follow a live model listing](#follow-a-live-model-listing)) |
+| `modelsTimeoutMs` | `5000` | Deadline of one listing request and of the first wait for a listing; read only with `discoverModels` |
+| `modelsMaxAgeMs` | `600000` | Interval between background listing refreshes; `0` refreshes on each access and runs no timer; read only with `discoverModels` |
 | `compat` | catalog detection | Wire-compatibility switches for unrecognized endpoints |
 | `defaultContextWindow` | `1,000,000` | Capacity fallback for undescribed models |
 | `defaultMaxTokens` | `128,000` | Output-cap fallback for undescribed models |
@@ -102,6 +105,34 @@ A provider pi-ai ships a login for can be signed into through the harness author
 
 A profile's `models` list replaces the route's installed catalog rather than extending it; each entry defaults its unset fields from the installed model of the same id, so narrowing a route to two models, correcting one capacity, or adding a model newer than the installed catalog are one-line edits. `modelOverrides` reshapes individual installed-catalog models without that cost — correct one model, keep the other thirty-seven — and is refused when set beside a `models` list, on a hand-declared route, or naming a model the catalog does not describe, because a silently unchanged model would be a typo someone hunts for later.
 
+### Follow a live model listing
+
+A gateway whose served models change over time can opt in with `discoverModels: true`. The route then reads `GET {baseURL}/models` and the listing, in its own order, decides which models selectors offer. The route needs `api` set to `openai-completions`, `openai-responses`, or `anthropic-messages` and a resolvable `baseURL`; other protocols are refused where the profile is written. Routes without the key behave exactly as before.
+
+```yaml
+- name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      cliproxy:
+        displayName: CLIProxyAPI
+        api: openai-completions
+        baseURL: http://127.0.0.1:8317/v1
+        headers:
+          Authorization: Bearer local-proxy-key
+        discoverModels: true
+        modelsTimeoutMs: 5000
+        modelsMaxAgeMs: 600000
+        models:
+          - id: gpt-5
+            contextWindow: 400000
+```
+
+`models` entries become metadata seed matched by id: a seed field wins, and the listing's name, context window, and output cap fill only the fields the seed leaves unset. A listed id without a seed entry takes the route's `defaultInput` (text), `defaultContextWindow`, and `defaultMaxTokens`, and does not reason. `models: []` is accepted only on a route with `discoverModels` on. A listed entry that cannot be materialized is skipped and logged; it never marks the route's configuration as broken.
+
+A seed entry the listing does not name stays resolvable, so roles and in-flight sessions that name it keep working, but selectors no longer offer it and the send gate refuses a new selection of it until the listing names it again. Before the first listing loads, while the endpoint fails, or when it answers with no models, the route serves its last good listing, or the seed when there is none; a failure logs one warning per failing streak. The first `listModels` of a route waits at most `modelsTimeoutMs` for the listing, later reads return at once and start a background refresh once the listing is `modelsMaxAgeMs` old. A changed listing emits `llm/models-updated`, which reloads selectors, and a model that disappeared logs one warning.
+
+The listing request carries the route's `headers` and its `apiKeyEnv` credential as `Authorization: Bearer` (or `x-api-key` on `anthropic-messages`); a route without `apiKeyEnv` is authenticated by its headers alone, and a route whose credential reference resolves to nothing reads no listing. `anthropic-version` is sent only on `anthropic-messages`, because CLIProxyAPI answers a different reply shape and renames ids when it sees that header or a `claude-cli` user agent. A change to the endpoint, protocol, headers, or key discards the held listing.
+
 ### Run with reasoning and wire compatibility
 
 `reasoningEfforts` declares a model's selectable thinking levels: each key is a level selectors offer, its value the spelling dispatch sends on the wire, so `max: ultra` renames a level for a gateway with its own vocabulary. Omitting the field keeps the installed catalog entry's capability; `false` declares a non-reasoning model. `compat` switches reshape the request for endpoints pi-ai cannot recognize — which role carries the system prompt, which field caps output, how a thinking level travels — configurable per route and per model. A model neither the entry nor the installed catalog sizes takes the route's `defaultContextWindow` and `defaultMaxTokens` fallbacks.
@@ -116,11 +147,11 @@ Each operation captures the current `providers` Config reference. New or changed
 
 ### Discover models from endpoints
 
-The plugin answers "which models can this provider serve?" for a route a configuration surface is editing or drafting. A route the installed catalog ships is answered from that catalog with no network call, preserving its `input` array as discovery `inputModalities`; only a route the catalog does not describe is interrogated over the wire. `openai-completions` and `openai-responses` use `GET {baseURL}/models` with bearer auth, while `anthropic-messages` uses native `GET /v1/models?limit=1000` semantics with `x-api-key` and `anthropic-version`; its listing URL accepts the API root with or without a trailing `/v1` because gateway documentation publishes both spellings, and only that listing URL normalizes the segment, so model requests receive the configured `baseURL` unchanged. A named configured route supplies its stored credential and profile `headers` inside the Host, so deployment headers configured through `cordis.patch.yml` or Cordis config reach model discovery without becoming discovery-request or Models-page fields; a key typed into the form still wins over the stored credential. The parser accepts either the standard `data` array or an enriched `models` map, normalizing each candidate's id, display name, context window, and output-token cap; Anthropic's `max_input_tokens` and `max_tokens` feed the same capacity fields, a map key remains the request id even when its entry names a different canonical id, primitive-valued map properties are ignored, and a missing display name falls back to that request id. The reply is candidate metadata a surface may offer for adoption — nothing is stored, and `cordis.patch.yml` remains the only thing that decides what a route serves.
+The plugin answers "which models can this provider serve?" for a route a configuration surface is editing or drafting. A route the installed catalog ships is answered from that catalog with no network call, preserving its `input` array as discovery `inputModalities`; only a route the catalog does not describe is interrogated over the wire. `openai-completions` and `openai-responses` use `GET {baseURL}/models` with bearer auth, while `anthropic-messages` uses native `GET /v1/models?limit=1000` semantics with `x-api-key` and `anthropic-version`; its listing URL accepts the API root with or without a trailing `/v1` because gateway documentation publishes both spellings, and only that listing URL normalizes the segment, so model requests receive the configured `baseURL` unchanged. A named configured route supplies its stored credential and profile `headers` inside the Host, so deployment headers configured through `cordis.patch.yml` or Cordis config reach model discovery without becoming discovery-request or Models-page fields; a key typed into the form still wins over the stored credential. The parser accepts either the standard `data` array or an enriched `models` map, normalizing each candidate's id, display name, context window, and output-token cap; Anthropic's `max_input_tokens` and `max_tokens` feed the same capacity fields, a map key remains the request id even when its entry names a different canonical id, primitive-valued map properties are ignored, and a missing display name falls back to that request id. The reply is candidate metadata a surface may offer for adoption — nothing is stored, and `cordis.patch.yml` remains the only thing that decides what a route serves. A route with `discoverModels` on reads the same endpoint through the same request code for its own in-memory listing ([Follow a live model listing](#follow-a-live-model-listing)); that listing is never written to disk either.
 
 ### Failures and recovery
 
-A route pi-ai does not ship needs `api`, `baseURL`, and a non-empty `models` list; an unserviceable profile is refused where it is written, naming the route and model. Failures carry stable codes: a credential that cannot be used fails with `INVALID_CREDENTIAL` naming the route and reference, a route whose `apiKeyEnv` reference resolves to nothing fails with `MISSING_CREDENTIAL`, an unconfigured model fails with `UNKNOWN_MODEL`, and terminal provider failures distinguish `QUOTA` from transient `RATE_LIMIT`. `GenerateOptions.stop` is rejected with `UNSUPPORTED_OPTION` because pi-ai's common streaming UI cannot guarantee it across providers.
+A route pi-ai does not ship needs `api`, `baseURL`, and a non-empty `models` list (a route with `discoverModels` on may leave `models` empty); an unserviceable profile is refused where it is written, naming the route and model. Failures carry stable codes: a credential that cannot be used fails with `INVALID_CREDENTIAL` naming the route and reference, a route whose `apiKeyEnv` reference resolves to nothing fails with `MISSING_CREDENTIAL`, an unconfigured model fails with `UNKNOWN_MODEL`, and terminal provider failures distinguish `QUOTA` from transient `RATE_LIMIT`. `GenerateOptions.stop` is rejected with `UNSUPPORTED_OPTION` because pi-ai's common streaming UI cannot guarantee it across providers.
 
 Config updates strictly validate changed providers. Initial loading retains stored catalog failures as editable provider diagnostics; unchanged failed providers do not block edits elsewhere. Serviceable models remain selectable, and unresolved models fail before network I/O. Repairing or deleting the offending configuration clears its diagnostic.
 
@@ -260,6 +291,8 @@ These limits define where the adapter stops and future work begins. They are cur
 - **Complete Config replacement can remove inherited dictionary entries** — a field reset instead restores its inherited value.
 - **`headers` can carry a credential the redactor never sees** — profile resolution rejects names and values Fetch cannot represent, but the dict remains plain strings; store credentials as `apiKeyEnv` references.
 - **Discovery does not change configured models** — adopt discovery results explicitly into the route configuration.
+- **A followed listing is not stored** — a route with `discoverModels` holds its listing in memory only, so an offline start serves the `models` seed until the first listing loads.
+- **A followed listing gives ids only** — CLIProxyAPI's `/models` discloses no capacities or modalities, so a listed model without a seed entry takes the route defaults; declare a seed entry to size it, give it images, or enable reasoning. Seed entries match by exact id, and there are no pattern overrides.
 - **Anthropic discovery reads at most 1,000 models** — the request uses the API's maximum page size but does not traverse `has_more`; entries beyond the first page must be added by hand.
 - **Uncataloged models need an unambiguous protocol** — catalog routes preserve each model's protocol, including both Azure APIs under `azure`. A model absent from a mixed-protocol catalog needs an explicit route-level `api`, which overrides every model on the route and must be one of the supported custom protocols. For Azure deployment names, keep the catalog model ID and set `AZURE_OPENAI_DEPLOYMENT_NAME_MAP`.
 - **A modality declaration is not verified** — a model declaring `image` its gateway does not serve is refused by the provider after prompt admission. The durable image remains in history and the same misdeclared model can fail again; switching to a text-only model remains possible because the shared LLM runtime projects image references into stable text for that request.

@@ -8,10 +8,13 @@
  * not disclose. Only a route the catalog does not describe — a gateway, a
  * self-hosted server — is interrogated over the wire.
  *
- * Neither path is a catalog refresh. Nothing here is stored: the request
- * carries a draft the user is still editing, and the reply is candidate
- * metadata the surface offers for adoption. `cordis.patch.yml` remains the only
- * thing that decides what a route serves.
+ * Neither path is a catalog refresh. `discoverModels` stores nothing: the
+ * request carries a draft the user is still editing, and the reply is
+ * candidate metadata the surface offers for adoption. `cordis.patch.yml`
+ * remains the only thing that decides what a route serves. A route that sets
+ * `discoverModels: true` reads its listing through {@link fetchModelListing}
+ * instead, and the route's in-memory listing cache (`listing.ts`) holds that
+ * reply; nothing is written to disk.
  *
  * OpenAI-compatible and Anthropic Messages protocols are interrogated through
  * their native model-listing endpoints. The parser accepts the standard
@@ -36,7 +39,7 @@ import { catalogModels } from './catalog.ts'
  * guessing at either would report an authentication failure as a provider
  * with no models. pi-ai's remaining protocols are absent for the same reason.
  */
-const LISTABLE_PROTOCOLS: ReadonlySet<string> = new Set([
+export const LISTABLE_PROTOCOLS: ReadonlySet<string> = new Set([
   'anthropic-messages',
   'openai-completions',
   'openai-responses',
@@ -304,7 +307,6 @@ export async function discoverModels(
       'DISCOVERY_UNSUPPORTED',
     )
   }
-  const url = listingUrl(request.baseURL, api)
   // A key typed into the form wins: it may replace the stored key that is
   // failing. The stored profile is asked past the catalog and protocol checks,
   // and its credential resolver remains lazy so a typed key cannot fail over a
@@ -313,9 +315,44 @@ export async function discoverModels(
   const stored = storedProfile?.()
   const supplied = request.apiKey ?? await stored?.resolveApiKey()
   const apiKey = supplied === undefined ? undefined : usableProbeKey(supplied)
+  return fetchModelListing({
+    api,
+    baseURL: request.baseURL,
+    ...stored?.headers === undefined ? {} : { headers: stored.headers },
+    ...apiKey === undefined ? {} : { apiKey },
+    ...request.signal === undefined ? {} : { signal: request.signal },
+  })
+}
+
+/** Inputs of one listing request. */
+export interface ModelListingRequest {
+  /** Wire protocol of the route; must be one of {@link LISTABLE_PROTOCOLS}. */
+  readonly api: string
+  /** Endpoint base the listing path is appended to. */
+  readonly baseURL: string
+  /** Deployment headers sent first; protocol, `accept`, and attribution headers override them. */
+  readonly headers?: Readonly<Record<string, string>>
+  /** Already validated key, sent with the protocol's native scheme; absent when headers alone authenticate. */
+  readonly apiKey?: string
+  /** Abandons the request and the body read. */
+  readonly signal?: AbortSignal
+}
+
+/**
+ * Read one endpoint's model listing over the wire. `anthropic-version` is sent
+ * only on `anthropic-messages`: an OpenAI-compatible gateway may answer a
+ * different reply, with renamed ids, when it sees that header.
+ * @param request - endpoint, protocol, headers, and key of the route.
+ * @returns the advertised models in endpoint order.
+ * @throws LlmError when the endpoint is unreachable, refuses the request, answers more than the size ceiling,
+ * or does not answer a model listing; `ABORTED` when `signal` fired.
+ */
+export async function fetchModelListing(request: ModelListingRequest): Promise<LlmDiscoveredModel[]> {
+  const { api, apiKey, signal } = request
+  const url = listingUrl(request.baseURL, api)
   let response: Response
   try {
-    const headers = new Headers(stored?.headers === undefined ? undefined : Object.entries(stored.headers))
+    const headers = new Headers(request.headers === undefined ? undefined : Object.entries(request.headers))
     headers.set('accept', 'application/json')
     if (api === 'anthropic-messages') {
       headers.set('anthropic-version', ANTHROPIC_VERSION)
@@ -327,10 +364,10 @@ export async function discoverModels(
     response = await fetch(url, {
       method: 'GET',
       headers,
-      ...request.signal === undefined ? {} : { signal: request.signal },
+      ...signal === undefined ? {} : { signal },
     })
   } catch (error: unknown) {
-    if (request.signal?.aborted) {
+    if (signal?.aborted) {
       throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
     }
     throw new LlmError(`could not reach ${url}`, 'DISCOVERY_FAILED', { cause: error })
@@ -348,7 +385,7 @@ export async function discoverModels(
     // Cancellation during the body read rejects with the abort reason, which
     // may be any value; the caller gets the same coded failure it would have
     // for a cancellation before the request went out.
-    if (request.signal?.aborted) {
+    if (signal?.aborted) {
       throw new LlmError('model discovery aborted by caller', 'ABORTED', { cause: error })
     }
     throw error
